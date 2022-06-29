@@ -202,6 +202,10 @@ class FinBert(object):
             weights = list()
             labels = self.label_list
 
+            # This is getting each label's corresponding weight to 
+            # handling label imbalance problem, the numerator 
+            # is total sample size, and the denominator represents
+            # each label's corresponding sample size.
             class_weights = [train.shape[0] / train[train.label == label].shape[0] for label in labels]
             self.class_weights = torch.tensor(class_weights)
 
@@ -217,21 +221,42 @@ class FinBert(object):
         model.to(self.device)
 
         # Prepare optimizer
+        # Here we set some layer that will not ruled by 
+        # discriminative fine-tuning strategy, and `no_decay` 
+        # contains these layers' names. 
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
         lr = self.config.learning_rate
+        # Here 'dft' is the abbreviation of 'discriminative fine-tuning' 
+        # mentioned in paper, so `dft_rate` is the rate of the 
+        # learning rate decay as getting lower layers.
         dft_rate = 1.2
 
+        # If using discriminative fine-tuning strategy
         if self.config.discriminate:
-            # apply the discriminative fine-tuning. discrimination rate is governed by dft_rate.
+            # apply the discriminative fine-tuning. discrimination rate is
+            # governed by `dft_rate`.
 
             encoder_params = []
+            # There are 12 encoder layers/blocks in standard BERT encoder.
             for i in range(12):
+                # Get each layer's learning related parameters which under
+                # dft strategy:
+                #   1. The weights which will be optimized using the 
+                #      learning rate coutrolled by dft strategy
+                #   2. weight decay?
+                #   3. the learning rate after the adjustment of dft
                 encoder_decay = {
                     'params': [p for n, p in list(model.bert.encoder.layer[i].named_parameters()) if
                                not any(nd in n for nd in no_decay)],
                     'weight_decay': 0.01,
                     'lr': lr / (dft_rate ** (12 - i))}
+                # Get each layer's learning related parameters which 
+                # not under dft strategy: 
+                #   1. The weights which will be optimized using the 
+                #      learning rate coutrolled by dft strategy
+                #   2. ...
+                #   3. ...
                 encoder_nodecay = {
                     'params': [p for n, p in list(model.bert.encoder.layer[i].named_parameters()) if
                                any(nd in n for nd in no_decay)],
@@ -240,6 +265,10 @@ class FinBert(object):
                 encoder_params.append(encoder_decay)
                 encoder_params.append(encoder_nodecay)
 
+            # Handling left layers beside encoder layers:
+            #   Handling the lowest layer: the embedding layer.
+            #   Handling some pooling layers
+            #   Handling classification layer.
             optimizer_grouped_parameters = [
                 {'params': [p for n, p in list(model.bert.embeddings.named_parameters()) if
                             not any(nd in n for nd in no_decay)],
@@ -265,6 +294,7 @@ class FinBert(object):
                  'weight_decay': 0.0,
                  'lr': lr}]
 
+            # Collect all learnable weights
             optimizer_grouped_parameters.extend(encoder_params)
 
 
@@ -277,9 +307,10 @@ class FinBert(object):
                 {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
 
+        # NOTE: Seems this variable is not used?
         schedule = "warmup_linear"
 
-
+        # The front steps which learning rate are limited by warnup strategy
         self.num_warmup_steps = int(float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
 
         self.optimizer = AdamW(optimizer_grouped_parameters,
@@ -318,11 +349,13 @@ class FinBert(object):
         logger.info("  Batch size = %d", self.config.train_batch_size)
         logger.info("  Num steps = %d", self.num_train_optimization_steps)
 
-        # Load the data, make it into TensorDataset
+        # Load the data, make it into TensorDataset 
+        # convert all kinds id list to `torck.tensor`.
         all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
         all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
         all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
 
+        # Convert label to `torch.tensor`
         if self.config.output_mode == "classification":
             all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
         elif self.config.output_mode == "regression":
@@ -370,10 +403,16 @@ class FinBert(object):
         # Training
         train_dataloader = self.get_loader(train_examples, 'train')
 
+        # Set model to training mode
         model.train()
 
+        # The batch number (in each epoch's training).
         step_number = len(train_dataloader)
 
+        # TODO: What's this `i` for?
+        # This `i` is used to control the deepest layer's level at 
+        # current stage, under "gradual freezing" strategy. 
+        # The layer level `i` is counted from top to bottom.
         i = 0
         for _ in trange(int(self.config.num_train_epochs), desc="Epoch"):
 
@@ -384,23 +423,44 @@ class FinBert(object):
 
             for step, batch in enumerate(tqdm(train_dataloader, desc='Iteration')):
 
+                # If using "gradual freezing" mentioned in paper, first of all 
+                # we should freeze all learnable parameters and then gradual 
+                # unfreeze them according the strategy, which means set each 
+                # learnable parameter's `requires_grad` attribute to `False`.
                 if (self.config.gradual_unfreeze and i == 0):
                     for param in model.bert.parameters():
                         param.requires_grad = False
-
+                
+                # `step_number` represents batch number in each epoch.
+                # So `step_number // 3` represents how many groups in 
+                # each epoch if collection each 3 neighborhood batchs 
+                # as 1 group. 
+                # So `(step % (step_number // 3)) == 0` lets the batchs 
+                # belonging same group shares same `i` value.
+                # The higher the `i`, the deeper the layer's weight could 
+                # be unfreezed.
                 if (step % (step_number // 3)) == 0:
                     i += 1
 
+                # Make the deepest layer's level (from top to bottom) is 
+                # smaller than the encoders' total number, also it should 
+                # lager than 1 since level 1 is the top leval which is 
+                # default learnable/unfreezed?
                 if (self.config.gradual_unfreeze and i > 1 and i < self.config.encoder_no):
 
                     for k in range(i - 1):
 
                         try:
                             for param in model.bert.encoder.layer[self.config.encoder_no - 1 - k].parameters():
+                                # Unfreezing layer's parameters by setting 
+                                # `requires_grad` attribute to `True`.
                                 param.requires_grad = True
                         except:
                             pass
-
+                
+                # If `i` is larger than self-attention encoder number, 
+                # the deeper layer, which means the embedding layer could 
+                # be unfreezed and set as learnable.
                 if (self.config.gradual_unfreeze and i > self.config.encoder_no + 1):
                     for param in model.bert.embeddings.parameters():
                         param.requires_grad = True
@@ -409,7 +469,11 @@ class FinBert(object):
 
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
+                # Which is "[CLS]" token's corresponding output after several 
+                # encoders.
                 logits = model(input_ids, attention_mask, token_type_ids)[0]
+                # Each label's weight, handling label imbalance problem, refer 
+                # https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html
                 weights = self.class_weights.to(self.device)
 
                 if self.config.output_mode == "classification":
@@ -420,15 +484,31 @@ class FinBert(object):
                     loss = loss_fct(logits.view(-1), label_ids.view(-1))
 
                 if self.config.gradient_accumulation_steps > 1:
+                    # This is equivalent to calculate mathmatical avergae 
+                    # of each batch's loss which belongs to gradient accumulation 
+                    # range.
+                    # TODO: This seems wierd since in this case, `loss.backward()` 
+                    # will never be called.
                     loss = loss / self.config.gradient_accumulation_steps
                 else:
                     loss.backward()
-
+ 
+                # TODO: 
+                # This `tr_loss`, `nb_tr_examples` and `nb_tr_steps` 
+                # seems never used.... 
                 tr_loss += loss.item()
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
+                # The last batch in each gradient accumulation group. 
+                # Not we do not needs explictly adds each batch's gradient 
+                # to accumulate them together in each gradient accumulation group 
+                # since if we don't explictly set each tensor's gradient to 0 
+                # by `optimizer.zero_grad()`, pytorch will accumulate the gradient 
+                # by default. This can refer to:
+                # https://pytorch.org/tutorials/beginner/basics/optimization_tutorial.html
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
                     if self.config.fp16:
+                        # TODO: Can't find definition of `warmup_linear`
                         lr_this_step = self.config.learning_rate * warmup_linear(
                             global_step / self.num_train_optimization_steps, self.config.warm_up_proportion)
                         for param_group in self.optimizer.param_groups:
@@ -436,6 +516,8 @@ class FinBert(object):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     self.optimizer.step()
                     self.scheduler.step()
+                    # Since after current batch, a new gradient accumulation group
+                    # will start, so set all learnable paramaeters' gradient to 0.
                     self.optimizer.zero_grad()
                     global_step += 1
 

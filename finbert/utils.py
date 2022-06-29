@@ -144,26 +144,50 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         label_map[None] = 9090
 
     features = []
+    # `ex_index` for example index
     for (ex_index, example) in enumerate(examples):
         tokens = tokenizer.tokenize(example.text)
 
+        # Using `max_seq_length - 2` but not `max_seq_length` as 
+        # cutoff threshold is because we need put 2 special token 
+        # into token list: [CLS] ans [SEP].
+        #
+        # [CLS] could be understood contains all information of 
+        # token list which could be used as the input for some 
+        # downstream tasks such as classification.
+        #
+        # [SEP] is used to mark the end of a sentence, it can also 
+        # use to seperate two sentences, this is very useful in some 
+        # tasks such as neural machine translation. 
         if len(tokens) > max_seq_length - 2:
             tokens = tokens[:(max_seq_length // 4) - 1] + tokens[
                                                           len(tokens) - (3 * max_seq_length // 4) + 1:]
 
+        # Integrate special tokens into tokenized text
         tokens = ["[CLS]"] + tokens + ["[SEP]"]
 
+        # If not sure about `token_type_ids`, refer 'Token Type IDs' and 
+        # 'token type IDs' in 
+        # https://huggingface.co/transformers/v3.2.0/glossary.html#general-terms 
         token_type_ids = [0] * len(tokens)
 
+        # Token ids, which will used as input of neural network.
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
 
+        # Not mask any token in this task
         attention_mask = [1] * len(input_ids)
 
+        # Is seems here is padding with <unk>, since which token 
+        # id is 0.
         padding = [0] * (max_seq_length - len(input_ids))
         input_ids += padding
+        # Using which token do padding is not important since 
+        # we will masking these padding tokens.
         attention_mask += padding
 
-
+        # Compensate padding tokens' holder in `token_type_ids`, since 
+        # token type id is not used in out task, so each token type's 
+        # id could be just set as 0
         token_type_ids += padding
 
         assert len(input_ids) == max_seq_length
@@ -177,6 +201,9 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         else:
             raise ValueError("The mode should either be classification or regression. You entered: " + mode)
 
+        # Some sentiment dataset allocated some volunteers to tagging/labeling 
+        # each text's sentiment label, as well as their aggrement level 
+        # to the label they tagged.
         agree = example.agree
         mapagree = {'0.5': 1, '0.66': 2, '0.75': 3, '1.0': 4}
         try:
